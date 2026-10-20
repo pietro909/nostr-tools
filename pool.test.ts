@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, expect, test } from 'bun:test'
 
-import { SimplePool, useWebSocketImplementation } from './pool.ts'
+import { SimplePool, type SubCloser, useWebSocketImplementation } from './pool.ts'
 import { finalizeEvent, generateSecretKey, getPublicKey, type Event } from './pure.ts'
 import { MockRelay, MockWebSocketClient } from './test-helpers.ts'
 import { hexToBytes } from '@noble/hashes/utils.js'
@@ -473,4 +473,76 @@ test('a relay CLOSED on querySync() does not take down other subscriptions on th
   expect(relay.ongoingOperations).toBe(1)
   expect(liveSubCloses).toBe(0)
   expect(relay.connected).toBeTrue()
+})
+
+test('closing a subscription closes the one reopened after auth', async () => {
+  const mockRelay = mockRelays[0]
+  mockRelay.authRequired = true
+  const relay = await pool.ensureRelay(mockRelay.url)
+
+  const sent: string[] = []
+  const send = relay.send.bind(relay)
+  relay.send = async (message: string) => {
+    sent.push(message)
+    return send(message)
+  }
+
+  const sk = generateSecretKey()
+  let sub: SubCloser
+  await new Promise<void>(resolve => {
+    sub = pool.subscribeMany(
+      [mockRelay.url],
+      { kinds: [1] },
+      {
+        onevent() {},
+        oneose: resolve,
+        onauth: async evt => finalizeEvent(evt, sk),
+      },
+    )
+  })
+  await sub!.close()
+
+  const reqIds = sent.filter(m => m.startsWith('["REQ"')).map(m => JSON.parse(m)[1])
+  expect(reqIds).toHaveLength(2)
+  expect(sent).toContain(JSON.stringify(['CLOSE', reqIds[1]]))
+  expect(relay.openSubs.size).toBe(0)
+  expect(relay.ongoingOperations).toBe(0)
+})
+
+test('closing a subscription while it authenticates does not reopen it', async () => {
+  const mockRelay = mockRelays[0]
+  mockRelay.authRequired = true
+  const relay = await pool.ensureRelay(mockRelay.url)
+
+  const sk = generateSecretKey()
+  let authStarted!: () => void
+  const authStartedPromise = new Promise<void>(resolve => (authStarted = resolve))
+  let finishAuth!: () => void
+  const finishAuthPromise = new Promise<void>(resolve => (finishAuth = resolve))
+
+  let closes = 0
+  const sub = pool.subscribeMany(
+    [mockRelay.url],
+    { kinds: [1] },
+    {
+      onevent() {},
+      onclose() {
+        closes++
+      },
+      onauth: async evt => {
+        authStarted()
+        await finishAuthPromise
+        return finalizeEvent(evt, sk)
+      },
+    },
+  )
+
+  await authStartedPromise
+  await sub.close()
+  finishAuth()
+  await new Promise(resolve => setTimeout(resolve, 50))
+
+  expect(relay.openSubs.size).toBe(0)
+  expect(relay.ongoingOperations).toBe(0)
+  expect(closes).toBe(1)
 })
