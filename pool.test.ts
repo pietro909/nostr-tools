@@ -437,3 +437,40 @@ test('oninvalidevent is called through the pool for invalid events', async done 
 
   relay._onmessage({ data: JSON.stringify(['EVENT', sub.id, wrongFieldTypeEvent]) } as MessageEvent)
 })
+
+test('a relay CLOSED on querySync() does not take down other subscriptions on that relay', async () => {
+  const mockRelay = mockRelays[0]
+  pool.idleTimeout = 50
+  const relay = await pool.ensureRelay(mockRelay.url)
+
+  let liveSubCloses = 0
+  pool.subscribeMany(
+    [mockRelay.url],
+    { kinds: [1] },
+    {
+      onevent() {},
+      onclose() {
+        liveSubCloses++
+      },
+    },
+  )
+
+  // answer the query's REQ with CLOSED instead of passing it on to the relay
+  const send = relay.send.bind(relay)
+  relay.send = async (message: string) => {
+    if (message.startsWith('["REQ","query:1"')) {
+      setTimeout(() => {
+        relay._onmessage({ data: JSON.stringify(['CLOSED', 'query:1', 'rate-limited: slow down']) } as MessageEvent)
+      }, 0)
+      return
+    }
+    return send(message)
+  }
+
+  await pool.querySync([mockRelay.url], { kinds: [1] }, { id: 'query:1' })
+
+  await new Promise(resolve => setTimeout(resolve, 150))
+  expect(relay.ongoingOperations).toBe(1)
+  expect(liveSubCloses).toBe(0)
+  expect(relay.connected).toBeTrue()
+})
